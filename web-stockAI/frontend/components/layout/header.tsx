@@ -34,8 +34,8 @@ export function Header() {
     const minute = now.getMinutes()
     const currentMinutes = hour * 60 + minute
     
-    // Market hours: 9:30 AM - 3:00 PM (540 - 900 minutes)
-    const marketOpenMinutes = 9 * 60 + 30 // 9:30 AM
+    // Market hours: 9:00 AM - 3:00 PM (540 - 900 minutes)
+    const marketOpenMinutes = 9 * 60 // 9:00 AM
     const marketCloseMinutes = 15 * 60 // 3:00 PM
     
     return day >= 1 && day <= 5 && currentMinutes >= marketOpenMinutes && currentMinutes < marketCloseMinutes
