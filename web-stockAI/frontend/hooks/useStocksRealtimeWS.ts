@@ -57,6 +57,14 @@ function loadChangeValues(symbol: string): { change: number; changePercent: numb
     return null;
 }
 
+// Kiểm tra hiện tại có trong giờ giao dịch HOSE không (T2-T6, 9h-15h)
+function isTradingHoursNow(): boolean {
+    const now = new Date();
+    const weekday = now.getDay();
+    const hour = now.getHours();
+    return weekday >= 1 && weekday <= 5 && hour >= 9 && hour < 15;
+}
+
 export function useStocksRealtimeWS() {
     const [stocks, setStocks] = useState<StockRealtime[]>([]);
     const referencesRef = useRef<Map<string, number>>(new Map());
@@ -64,12 +72,16 @@ export function useStocksRealtimeWS() {
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectRef = useRef<NodeJS.Timeout | null>(null);
     const updateTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const tradingCheckRef = useRef<NodeJS.Timeout | null>(null);
 
     useEffect(() => {
         let isMounted = true;
 
         function connectWS() {
-            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            if (!isMounted || !isTradingHoursNow()) return;
+            if (wsRef.current &&
+                (wsRef.current.readyState === WebSocket.OPEN ||
+                wsRef.current.readyState === WebSocket.CONNECTING)) {
                 return;
             }
             const socket = new WebSocket(
@@ -174,7 +186,10 @@ export function useStocksRealtimeWS() {
                 }, 150);
             };
             socket.onclose = () => {
-                reconnectRef.current = setTimeout(connectWS, 3000);
+                // Chỉ reconnect khi vẫn còn trong giờ giao dịch
+                if (isMounted && isTradingHoursNow()) {
+                    reconnectRef.current = setTimeout(connectWS, 3000);
+                }
             };
             socket.onerror = (e) => {
                 console.error("⚠️ WebSocket error:", e);
@@ -282,22 +297,31 @@ export function useStocksRealtimeWS() {
 
         fetchInitialData();
 
-        // 3. Connect WebSocket chỉ khi sàn hoạt động
-        const now = new Date();
-        const weekday = now.getDay();
-        const hour = now.getHours();
-        const isTradingHours = weekday >= 1 && weekday <= 5 && hour >= 9 && hour < 15;
-        
-        if (isTradingHours) {
-            console.log("⏯️ Trong giờ giao dịch, kết nối WS...");
-            connectWS();
-        } else if (weekday >= 1 && weekday <= 5 && hour >= 15) {
-            console.log("📊 Sau giờ giao dịch, hiển thị dữ liệu cuối ngày");
-        } else if (weekday === 0 || weekday === 6) {
-            console.log("📅 Cuối tuần, hiển thị dữ liệu T6");
-        } else {
-            console.log("🌅 Sáng sớm trước 9h, để trống");
+        // 3. Đồng bộ WebSocket với giờ giao dịch.
+        //    Kiểm tra định kỳ mỗi 30s: tự kết nối khi vào phiên (kể cả khi
+        //    mở trang trước 9h), tự đóng khi hết phiên.
+        function syncWsWithTradingHours() {
+            if (!isMounted) return;
+            const open = wsRef.current?.readyState === WebSocket.OPEN;
+            const connecting = wsRef.current?.readyState === WebSocket.CONNECTING;
+
+            if (isTradingHoursNow()) {
+                if (!open && !connecting) {
+                    console.log("⏯️ Trong giờ giao dịch, kết nối WS...");
+                    connectWS();
+                }
+            } else if (open || connecting) {
+                console.log("📊 Hết giờ giao dịch, đóng WS.");
+                if (reconnectRef.current) {
+                    clearTimeout(reconnectRef.current);
+                    reconnectRef.current = null;
+                }
+                wsRef.current?.close();
+            }
         }
+
+        syncWsWithTradingHours();
+        tradingCheckRef.current = setInterval(syncWsWithTradingHours, 30000);
 
         return () => {
             isMounted = false;
@@ -309,6 +333,10 @@ export function useStocksRealtimeWS() {
             if (updateTimerRef.current) {
                 clearTimeout(updateTimerRef.current);
                 updateTimerRef.current = null;
+            }
+            if (tradingCheckRef.current) {
+                clearInterval(tradingCheckRef.current);
+                tradingCheckRef.current = null;
             }
             if (wsRef.current &&
                 (wsRef.current.readyState === WebSocket.OPEN ||
