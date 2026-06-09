@@ -11,8 +11,28 @@ import os
 import time
 from prometheus_client import Histogram, Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from zoneinfo import ZoneInfo
+import pandas as pd
+import holidays
+
+VN_HOLIDAYS = holidays.country_holidays("VN")
 
 logger = logging.getLogger(__name__)
+
+def _ws_allowed_origins():
+    raw = os.getenv("WS_ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        return None
+    return {o.strip() for o in raw.split(",") if o.strip()}
+
+async def _close_if_origin_forbidden(websocket: WebSocket) -> bool:
+    allowed = _ws_allowed_origins()
+    if allowed is None:
+        return False
+    origin = websocket.headers.get("origin")
+    if origin and origin in allowed:
+        return False
+    await websocket.close(code=1008)
+    return True
 
 stock_router = APIRouter()
 
@@ -23,16 +43,25 @@ cdc_connections = Gauge('cdc_active_connections', 'Active WebSocket connections'
 def in_trading_hours():
     vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
     now = datetime.datetime.now(vn_tz)
-    weekday = now.weekday()
-    trading_time = now.time()
-    hour = now.hour
-    minute = now.minute
-    if weekday >= 5: 
+    if now.weekday() >= 5 or now.date() in VN_HOLIDAYS:
         return False
-    start = datetime.time(9, 0)
-    end = datetime.time(15, 0)
-    is_trading = start <= trading_time < end
-    return is_trading
+    return datetime.time(9, 0) <= now.time() < datetime.time(15, 0)
+
+
+def realtime_trading_hours_only():
+    v = os.getenv("REALTIME_TRADING_HOURS_ONLY", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _is_trading_day(d):
+    return d.weekday() < 5 and d not in VN_HOLIDAYS
+
+
+def _next_trading_day(d):
+    nxt = d + datetime.timedelta(days=1)
+    while not _is_trading_day(nxt):
+        nxt += datetime.timedelta(days=1)
+    return nxt
 
 
 def next_trading_time():
@@ -40,20 +69,10 @@ def next_trading_time():
     vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
     now = datetime.datetime.now(vn_tz)
     if in_trading_hours():
-        end_time = datetime.datetime.combine(now.date(), datetime.time(15, 0))
-        if end_time > now:
-            return end_time
-        next_day = now + datetime.timedelta(days=1)
-        return datetime.datetime.combine(next_day.date(), datetime.time(9, 0))
-    weekday = now.weekday()
-    if weekday >= 5:
-        days_until_monday = 7 - weekday
-        next_date = now.date() + datetime.timedelta(days=days_until_monday)
-        return datetime.datetime.combine(next_date, datetime.time(9, 0))
-    if now.time() < datetime.time(9, 0):
-        return datetime.datetime.combine(now.date(), datetime.time(9, 0))
-    next_day = now + datetime.timedelta(days=1)
-    return datetime.datetime.combine(next_day.date(), datetime.time(9, 0)) 
+        return datetime.datetime.combine(now.date(), datetime.time(15, 0), tzinfo=vn_tz)
+    if _is_trading_day(now.date()) and now.time() < datetime.time(9, 0):
+        return datetime.datetime.combine(now.date(), datetime.time(9, 0), tzinfo=vn_tz)
+    return datetime.datetime.combine(_next_trading_day(now.date()), datetime.time(9, 0), tzinfo=vn_tz)
 
 def cassandra_date_to_iso(cass_date):
     """
@@ -70,73 +89,40 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
     
 
+_DAILY_SUMMARY_QUERY = "SELECT symbol, trade_date, open, high, low, close, volume FROM stock_daily_summary where trade_date = %s"
+
+
+def _fetch_daily_summary(db, start_date, max_lookback=10):
+    d = start_date
+    for _ in range(max_lookback):
+        if d.weekday() < 5 and d not in VN_HOLIDAYS:
+            rows = list(db.execute(_DAILY_SUMMARY_QUERY, (d,)))
+            if rows:
+                results = [{
+                    "symbol": r.symbol.split(".")[0],
+                    "trade_date": cassandra_date_to_iso(r.trade_date),
+                    "close": r.close,
+                    "open": r.open,
+                    "high": r.high,
+                    "low": r.low,
+                    "volume": r.volume,
+                } for r in rows]
+                return sorted(results, key=lambda x: x["symbol"])
+        d -= datetime.timedelta(days=1)
+    return []
+
+
 @stock_router.get("/get_reference")
-async def read_stocks(db=Depends(get_db)):
-    query = "SELECT symbol, trade_date, open, high, low, close, volume FROM stock_daily_summary where trade_date = %s"
-    vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
-    now = datetime.datetime.now(vn_tz)
-    # Xác định ngày giao dịch gần nhất (tránh cuối tuần)
-    trading_date = now.date()
-    if now.hour < 9 :
-        trading_date = trading_date - datetime.timedelta(days=1)
-        while trading_date.weekday() >= 4:
-            trading_date = trading_date - datetime.timedelta(days=int(trading_date.weekday() - 3))
-    else:
-        if trading_date.weekday() >= 5:
-            trading_date = trading_date - datetime.timedelta(days=int(trading_date.weekday() - 3))
-        elif trading_date.weekday() == 0:
-            trading_date = trading_date - datetime.timedelta(days=3)
-        else:
-            trading_date = trading_date - datetime.timedelta(days=1)
-    rows = db.execute(query, (trading_date,))
-    results = []
-    for row in rows:
-        results.append({
-            "symbol": row.symbol.split(".")[0],
-            "trade_date": cassandra_date_to_iso(row.trade_date),
-            "close": row.close,
-            "open": row.open,
-            "high": row.high,
-            "low": row.low,
-            "volume": row.volume
-        })
-    # Sắp xếp theo symbol
-    results = sorted(results, key=lambda x: x["symbol"])
-    return results
+async def get_reference(db=Depends(get_db)):
+    today = datetime.datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()
+    return _fetch_daily_summary(db, today - datetime.timedelta(days=1))
 
 
 @stock_router.get("/get_stocks")
-async def read_stocks(db=Depends(get_db)):
-    query = "SELECT symbol, trade_date, open, high, low, close, volume FROM stock_daily_summary where trade_date = %s"
-    vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
-    now = datetime.datetime.now(vn_tz)
-    # Xác định ngày giao dịch gần nhất (tránh cuối tuần)
-    trading_date = now.date()
-    if now.hour < 9:
-        if trading_date.weekday() >= 5:
-            trading_date = trading_date - datetime.timedelta(days=int(trading_date.weekday() - 4))
-        elif trading_date.weekday() == 0:
-            trading_date = trading_date - datetime.timedelta(days=3)
-        else:
-            trading_date = trading_date - datetime.timedelta(days=1)
-    else:
-        if trading_date.weekday() >= 5:
-            trading_date = trading_date - datetime.timedelta(days=int(trading_date.weekday() - 4))
-    rows = db.execute(query, (trading_date,))
-    results = []
-    for row in rows:
-        results.append({
-            "symbol": row.symbol.split(".")[0],
-            "trade_date": cassandra_date_to_iso(row.trade_date),
-            "close": row.close,
-            "open": row.open,
-            "high": row.high,
-            "low": row.low,
-            "volume": row.volume
-        })
-    # Sắp xếp theo symbol
-    results = sorted(results, key=lambda x: x["symbol"])
-    return results
+async def get_stocks(db=Depends(get_db)):
+    now = datetime.datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    start = now.date() if now.time() >= datetime.time(9, 0) else now.date() - datetime.timedelta(days=1)
+    return _fetch_daily_summary(db, start)
 
 
 @stock_router.get("/stocks_latest")
@@ -466,85 +452,29 @@ async def get_stock_predictions_accuracy(db=Depends(get_db)):
         cur = conn.cursor()
         
         cur.execute("""
-            SELECT stock_code, prediction_date, predicted_price
-            FROM fact_predictions
-            ORDER BY stock_code, prediction_date
+            SELECT p.stock_code, p.prediction_date, p.predicted_price, d.close as actual_price
+            FROM fact_predictions p LEFT JOIN fact_daily_prices d 
+            ON ( p.stock_code = d.stock_code 
+            OR p.stock_code = split_part(d.stock_code, '.', 1)) 
+            AND p.prediction_date = d.trade_date
+            ORDER BY p.stock_code, p.prediction_date;
         """)
         
-        predictions = cur.fetchall()
+        df = pd.DataFrame(cur.fetchall(), columns=['stock_code', 'prediction_date', 'predicted_price', 'actual_price'])
         
-        price_cache = {}
-        symbol_dates_map = {}
+        df['actual_trend'] = (df['actual_price'].shift(-1) - df['actual_price']).apply(lambda x: 0 if x == 0 else 1 if x > 0 else -1)
+        df['predicted_trend'] = (df['predicted_price'].shift(-1) - df['predicted_price']).apply(lambda x: 0 if x == 0 else 1 if x > 0 else -1)
         
-        for pred in predictions:
-            stock_code = pred[0]
-            prediction_date = pred[1]
-            
-            if stock_code not in symbol_dates_map:
-                symbol_dates_map[stock_code] = set()
-            
-            symbol_dates_map[stock_code].add(prediction_date)
-            
-            prev_date = prediction_date - datetime.timedelta(days=1)
-            while prev_date.weekday() >= 5:
-                prev_date = prev_date - datetime.timedelta(days=1)
-            symbol_dates_map[stock_code].add(prev_date)
+        df['is_correct'] = df['actual_trend'] == df['predicted_trend']
         
-        for stock_code, dates in symbol_dates_map.items():
-            symbol_with_exchange = stock_code + ".VN"
-            min_date = min(dates)
-            max_date = max(dates)
-            
-            query = "SELECT trade_date, close FROM stock_daily_summary WHERE symbol = %s AND trade_date >= %s AND trade_date <= %s"
-            rows = db.execute(query, (symbol_with_exchange, min_date, max_date))
-            for row in rows:
-                trade_date = row.trade_date
-                if hasattr(trade_date, 'date'):
-                    trade_date = trade_date.date()
-                price_cache[(stock_code, trade_date)] = float(row.close)
-        
-        results = []
-        accuracy_by_symbol = {}
-        
-        for pred in predictions:
-            stock_code = pred[0]
-            prediction_date = pred[1]
-            predicted_price = float(pred[2])
-            
-            prev_date = prediction_date - datetime.timedelta(days=1)
-            while prev_date.weekday() >= 5:
-                prev_date = prev_date - datetime.timedelta(days=1)
-            
-            prev_close = price_cache.get((stock_code, prev_date))
-            actual_close = price_cache.get((stock_code, prediction_date))
-            
-            if prev_close is None or actual_close is None:
-                continue
-            
-            predicted_trend = "up" if predicted_price > prev_close else ("down" if predicted_price < prev_close else "neutral")
-            actual_trend = "up" if actual_close > prev_close else ("down" if actual_close < prev_close else "neutral")
-            
-            is_correct = predicted_trend == actual_trend
-            
-            if stock_code not in accuracy_by_symbol:
-                accuracy_by_symbol[stock_code] = {"correct": 0, "total": 0}
-            
-            accuracy_by_symbol[stock_code]["total"] += 1
-            if is_correct:
-                accuracy_by_symbol[stock_code]["correct"] += 1
-        
-        for symbol, stats in accuracy_by_symbol.items():
-            accuracy = (stats["correct"] / stats["total"]) * 100 if stats["total"] > 0 else 0
-            results.append({
-                "symbol": symbol,
-                "accuracy": round(accuracy, 2),
-                "correct": stats["correct"],
-                "total": stats["total"]
-            })
-        
-        results.sort(key=lambda x: x["symbol"])
-        return results
-        
+        # Tính accuracy theo từng stock, gồm symbol, accuracy, correct, total
+        accuracy_by_stock = df.groupby('stock_code')['is_correct'].agg(['mean', 'sum', 'count']).reset_index()
+        accuracy_by_stock.columns = ['symbol', 'accuracy', 'correct', 'total']
+        accuracy_by_stock['accuracy'] = round(accuracy_by_stock['accuracy'] * 100, 2)
+        accuracy_by_stock['correct'] = accuracy_by_stock['correct'].astype(int)
+        accuracy_by_stock['total'] = accuracy_by_stock['total'].astype(int)
+        return accuracy_by_stock.to_dict(orient='records')
+
     except Exception as e:
         logger.error(f"Error calculating predictions accuracy: {e}")
         raise
@@ -553,43 +483,28 @@ async def get_stock_predictions_accuracy(db=Depends(get_db)):
             cur.close()
         if 'conn' in locals():
             conn.close()
-    
-
-
-
-@stock_router.get("/stock_prices_week")
-async def get_stock_prices_week(symbol: str, db=Depends(get_db)):
-    end_date = datetime.date.today()
-    start_date = end_date - datetime.timedelta(days=7)
-    weekday_end = end_date.weekday()
-    if weekday_end == 5:
-        end_date = end_date
-    elif weekday_end == 6:
-        end_date = end_date - datetime.timedelta(days=1)
-    start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0, 0))
-    end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
-    start_timestamp_ms = str(int(start_dt.timestamp() * 1000))
-    end_timestamp_ms = str(int(end_dt.timestamp() * 1000))
-    query = "SELECT * FROM stock_prices WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s"
-    rows = db.execute(query, (symbol + ".VN", start_timestamp_ms, end_timestamp_ms))
-    def row_to_dict(row):
-        return {
-            "symbol": row.symbol,
-            "timestamp": row.timestamp,
-            "price": row.price,
-            "change": row.change,
-            "change_percent": row.change_percent,
-            "day_volume": row.day_volume,
-            "last_size": row.last_size,
-        }
-    return [row_to_dict(row) for row in rows.all()]
 
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
-        self.cdc_task: asyncio.Task = None
+        self.cdc_task: asyncio.Task | None = None
         self.cdc_process = None
+
+    def start_background_cdc(self):
+        if self.cdc_task is not None and not self.cdc_task.done():
+            return
+        self.cdc_task = asyncio.create_task(self.cdc_consumer_task())
+
+    async def shutdown_background_cdc(self):
+        if self.cdc_task and not self.cdc_task.done():
+            self.cdc_task.cancel()
+            try:
+                await self.cdc_task
+            except asyncio.CancelledError:
+                pass
+        self.cdc_task = None
+        await self.stop_cdc_process()
 
     async def connect(self, websocket: WebSocket):
         logger.info("🔗 Manager.connect() called")
@@ -597,22 +512,11 @@ class ConnectionManager:
         self.active_connections.append(websocket)
         cdc_connections.set(len(self.active_connections))
         logger.info(f"WebSocket accepted. Total connections: {len(self.active_connections)}")
-        
-        if self.cdc_task is None or self.cdc_task.done():
-            logger.info("🚀 Starting CDC task...")
-            self.cdc_task = asyncio.create_task(self.cdc_consumer_task())
-        else:
-            logger.info("⏳ CDC task already running")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
         cdc_connections.set(len(self.active_connections))
-        
-        if not self.active_connections and self.cdc_task:
-            self.cdc_task.cancel()
-            if self.cdc_process:
-                self.cdc_process.terminate()
 
     async def broadcast(self, message: str):
         if not self.active_connections:
@@ -657,51 +561,76 @@ class ConnectionManager:
                 return value.replace('"', '')
         return None
 
+    def parse_cassandra_hosts(self, cassandra_host_raw: str):
+        if not cassandra_host_raw:
+            return ["localhost"]
+
+        if cassandra_host_raw.startswith('['):
+            try:
+                hosts = json.loads(cassandra_host_raw)
+                parsed_hosts = [h.strip() for h in hosts if isinstance(h, str) and h.strip()]
+                if parsed_hosts:
+                    return parsed_hosts
+            except Exception as e:
+                logger.error(f"Failed to parse CASSANDRA_HOST list: {e}")
+
+        return [cassandra_host_raw.strip()]
+
+    async def stop_cdc_process(self):
+        if not self.cdc_process:
+            return
+
+        try:
+            if self.cdc_process.returncode is None:
+                self.cdc_process.terminate()
+                await asyncio.wait_for(self.cdc_process.wait(), timeout=3)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                if self.cdc_process.returncode is None:
+                    self.cdc_process.kill()
+            except ProcessLookupError:
+                pass
+
     async def cdc_consumer_task(self):
         try:
             cdc_bin = os.getenv('CDC_PRINTER_PATH', '/home/obito/main/scylla-cdc-printer/target/release/scylla-cdc-printer')
             cassandra_host_raw = os.getenv('CASSANDRA_HOST', 'localhost')
             keyspace = os.getenv('CASSANDRA_KEYSPACE', 'stock_data')
-            
-            cassandra_host = cassandra_host_raw
-            if cassandra_host_raw.startswith('['):
-                try:
-                    import json
-                    hosts = json.loads(cassandra_host_raw)
-                    cassandra_host = hosts[0] if hosts else 'localhost'
-                    logger.info(f"Parsed CASSANDRA_HOST from array, using: {cassandra_host}")
-                except Exception as e:
-                    logger.error(f"Failed to parse CASSANDRA_HOST: {e}, using default")
-                    cassandra_host = 'localhost'
+            cassandra_hosts = self.parse_cassandra_hosts(cassandra_host_raw)
+            host_index = 0
+            logger.info(f"Parsed CASSANDRA_HOST candidates: {cassandra_hosts}")
             
             if not os.path.exists(cdc_bin):
                 logger.error(f"CDC binary not found at {cdc_bin}")
                 logger.error("Please build scylla-cdc-printer or set CDC_PRINTER_PATH env var")
                 return
-            
-            args = [
-                cdc_bin,
-                "-k", keyspace,
-                "-t", "stock_latest_prices",
-                "-h", cassandra_host,
-                "--window-size", "1",
-                "--safety-interval", "0",
-                "--sleep-interval", "0"
-            ]
-            logger.info(f"CDC consumer task started. CDC bin: {cdc_bin}, Cassandra host: {cassandra_host}, Keyspace: {keyspace}")
+
+            logger.info(f"CDC consumer task started. CDC bin: {cdc_bin}, Keyspace: {keyspace}")
             
             while True:
-                now = datetime.datetime.now()
-                logger.info(f"Checking trading hours at {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                if not in_trading_hours():
-                    next_time = next_trading_time()
-                    wait_seconds = (next_time - datetime.datetime.now()).total_seconds()
-                    if wait_seconds > 0:
-                        logger.info(f"Outside trading hours. Waiting until {next_time.strftime('%Y-%m-%d %H:%M')} to start CDC")
-                        await asyncio.sleep(wait_seconds)
-                
-                logger.info("✅ In trading hours, starting CDC process")
+                now = datetime.datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+                if realtime_trading_hours_only():
+                    logger.info(f"Checking trading hours at {now.strftime('%Y-%m-%d %H:%M:%S')}")
+                    if not in_trading_hours():
+                        next_time = next_trading_time()
+                        wait_seconds = (next_time - datetime.datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))).total_seconds()
+                        if wait_seconds > 0:
+                            logger.info(f"Outside trading hours. Waiting until {next_time.strftime('%Y-%m-%d %H:%M')} to start CDC")
+                            await asyncio.sleep(wait_seconds)
+                    logger.info("In trading hours, starting CDC process")
+                else:
+                    logger.info(f"CDC always-on mode at {now.strftime('%Y-%m-%d %H:%M:%S')}, starting CDC process")
+
+                cassandra_host = cassandra_hosts[host_index % len(cassandra_hosts)]
+                args = [
+                    cdc_bin,
+                    "-k", keyspace,
+                    "-t", "stock_latest_prices",
+                    "-h", cassandra_host,
+                    "--window-size", "1",
+                    "--safety-interval", "0",
+                    "--sleep-interval", "0.1"
+                ]
                 
                 logger.info(f"Starting CDC process with command: {' '.join(args)}")
                 
@@ -713,13 +642,16 @@ class ConnectionManager:
                     )
                 except Exception as e:
                     logger.error(f"Failed to start CDC process: {e}")
+                    host_index += 1
                     await asyncio.sleep(5)
                     continue
                 
+                await asyncio.sleep(0.5)
                 if self.cdc_process.returncode is not None:
                     logger.error(f"CDC process exited immediately with code {self.cdc_process.returncode}")
                     stderr = await self.cdc_process.stderr.read()
                     logger.error(f"CDC stderr: {stderr.decode()}")
+                    host_index += 1
                     await asyncio.sleep(5)
                     continue
                 
@@ -744,10 +676,10 @@ class ConnectionManager:
                 
                 try:
                     async for line_bytes in self.cdc_process.stdout:
-                        if not in_trading_hours():
+                        if realtime_trading_hours_only() and not in_trading_hours():
                             logger.info("Trading hours ended, breaking CDC loop")
                             break
-                        
+
                         line = line_bytes.decode('utf-8').strip()
                         if not line:
                             continue
@@ -781,11 +713,11 @@ class ConnectionManager:
                                     logger.info(f"📊 Processed {msg_count} CDC messages")
                                 
                                 await self.broadcast(json.dumps(current_record, ensure_ascii=False))
-                            
-                            if not in_trading_hours():
+
+                            if realtime_trading_hours_only() and not in_trading_hours():
                                 logger.info("Trading hours ended during processing")
                                 break
-                            
+
                             # Reset cho record tiếp theo
                             current_record = {}
                             t3_first_line = None
@@ -848,54 +780,37 @@ class ConnectionManager:
                         stderr_task.cancel()
                     except:
                         pass
-                    if self.cdc_process:
-                        try:
-                            self.cdc_process.terminate()
-                            await asyncio.wait_for(self.cdc_process.wait(), timeout=3)
-                        except Exception as e:
-                            logger.error(f"Error stopping CDC process: {e}")
-                            try:
-                                self.cdc_process.kill()
-                            except:
-                                pass
+                    await self.stop_cdc_process()
+
+                    if self.cdc_process and self.cdc_process.returncode not in (None, 0):
+                        host_index += 1
                 
         except asyncio.CancelledError:
             logger.info("CDC consumer cancelled")
-            if self.cdc_process:
-                try:
-                    self.cdc_process.terminate()
-                    await asyncio.wait_for(self.cdc_process.wait(), timeout=3)
-                except:
-                    self.cdc_process.kill()
+            await self.stop_cdc_process()
         except Exception as e:
             logger.error(f"CDC consumer error: {e}")
             logger.exception(e)
         finally:
-            if self.cdc_process:
-                try:
-                    self.cdc_process.terminate()
-                    try:
-                        self.cdc_process.kill()
-                    except:
-                        pass
-                except:
-                    pass
+            await self.stop_cdc_process()
 
 manager = ConnectionManager()
 
 @stock_router.websocket("/ws/stocks_realtime")
 async def websocket_endpoint(websocket: WebSocket):
     logger.info("WebSocket connection request received")
-    
+    if await _close_if_origin_forbidden(websocket):
+        return
+
     is_in_hours = in_trading_hours()
-    logger.info(f"Trading hours check: {is_in_hours}")
-    
-    if not is_in_hours:
+    logger.info(f"Trading hours check: {is_in_hours} (limit_ws={realtime_trading_hours_only()})")
+
+    if realtime_trading_hours_only() and not is_in_hours:
         await websocket.accept()
         await websocket.send_text(json.dumps({"error": "Outside trading hours"}))
         await websocket.close()
         return
-    
+
     logger.info("Accepting WebSocket connection")
     await manager.connect(websocket)
     logger.info(f"WebSocket connected. Total connections: {len(manager.active_connections)}")

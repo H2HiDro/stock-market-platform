@@ -9,6 +9,8 @@ services:
       - ../scylla-cdc-printer:/cdc-printer:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - REALTIME_TRADING_HOURS_ONLY=${REALTIME_TRADING_HOURS_ONLY:-true}
+      - WS_ALLOWED_ORIGINS=${WS_ALLOWED_ORIGINS:-}
       - CASSANDRA_HOST=["scylla-node1","scylla-node2","scylla-node3"]
       - CASSANDRA_PORT=9042
       - CASSANDRA_KEYSPACE=stock_data
@@ -17,21 +19,18 @@ services:
 
     restart: always
     networks:
-      - financi-network
+      financi-network:
+        ipv4_address: 172.18.0.123
 
   frontend:
     build: ./frontend
     container_name: webstock-frontend
     ports:
       - "3005:3000"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
-      - ./frontend/.env.local:/app/.env.local:ro
     environment:
-      - NEXT_PUBLIC_API_URL=https://api.kytran.io.vn
-      - NEXT_PUBLIC_WS_URL=https://api.kytran.io.vn
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-https://api.kytran.io.vn}
+      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-https://api.kytran.io.vn}
+      - NODE_ENV=production
     depends_on:
       - backend
     restart: always
@@ -46,7 +45,14 @@ services:
     networks:
       - financi-network
       
-
+  cloudflared-2:
+    image: cloudflare/cloudflared:latest
+    container_name: webstock-cloudflared-2
+    command: tunnel --no-autoupdate run --token ${API_KEY_CLOUDFLARE_2}
+    restart: unless-stopped
+    networks:
+      - financi-network
+      
 networks:
   financi-network:
     external: true

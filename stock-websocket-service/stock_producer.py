@@ -1,5 +1,8 @@
-import signal, asyncio, logging, os, time
-from confluent_kafka.admin import AdminClient, NewTopic
+import signal, asyncio, logging, os, time, sys
+from datetime import datetime
+import pytz
+from confluent_kafka.admin import AdminClient, NewTopic, NewPartitions
+from confluent_kafka import KafkaException, KafkaError
 from confluent_kafka import SerializingProducer
 from confluent_kafka.serialization import StringSerializer
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -11,6 +14,19 @@ yf.set_tz_cache_location("/home/obito/.cache/py-yfinance")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY = 10
+MESSAGE_TIMEOUT = 60
+VN_TIMEZONE = pytz.timezone('Asia/Ho_Chi_Minh')
+
+def is_trading_hours():
+    now = datetime.now(VN_TIMEZONE)
+    if now.weekday() >= 5:
+        return False
+    hour = now.hour
+    minute = now.minute
+    return (hour == 9 and minute >= 0) or (9 < hour < 15) or (hour == 15 and minute == 0)
 
 schema_registry_conf = {'url': os.getenv('SCHEMA_REGISTRY_URL')}
 schema_registry_client = SchemaRegistryClient(schema_registry_conf)
@@ -45,8 +61,7 @@ class StockDataProducer:
         
         bootstrap = bootstrap or os.getenv('KAFKA_BOOTSTRAP_SERVERS')
         self.admin = AdminClient({'bootstrap.servers': bootstrap})
-        if topic not in self.admin.list_topics(timeout=5).topics:
-            self.admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=replication)])
+        self._ensure_topic(topic, partitions, replication)
         
         self.avro_serializer = AvroSerializer(
             schema_registry_client=schema_registry_client,
@@ -64,11 +79,51 @@ class StockDataProducer:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
+    def _ensure_topic(self, topic, partitions, replication):
+        meta = self.admin.list_topics(timeout=10)
+        existing = meta.topics.get(topic)
+
+        if existing is None:
+            logger.info(f"Topic '{topic}' chưa tồn tại — tạo mới với {partitions} partitions, replication={replication}")
+            fut = self.admin.create_topics([
+                NewTopic(topic, num_partitions=partitions, replication_factor=replication)
+            ])[topic]
+            fut.result()
+            return
+
+        current = len(existing.partitions)
+        if current == partitions:
+            logger.info(f"Topic '{topic}' đã có đủ {partitions} partitions — OK")
+            return
+
+        if current > partitions:
+            logger.warning(
+                f"Topic '{topic}' đang có {current} partitions > yêu cầu {partitions}. "
+                f"Kafka không hỗ trợ giảm partition; giữ nguyên."
+            )
+            return
+
+        logger.info(f"Topic '{topic}' đang có {current} partitions, đang alter lên {partitions}...")
+        fut = self.admin.create_partitions([NewPartitions(topic, new_total_count=partitions)])[topic]
+        try:
+            fut.result()
+            logger.info(f"Đã alter topic '{topic}' lên {partitions} partitions")
+        except KafkaException as e:
+            if e.args and e.args[0].code() == KafkaError.INVALID_PARTITIONS:
+                logger.info(f"Topic '{topic}' đã được alter bởi producer khác — bỏ qua")
+            else:
+                raise
+
     def _signal_handler(self, signum, frame):
         logger.info(f"Nhận signal {signum}, đang shutdown...")
         self.shutdown_event.set()
 
     def _send(self, msg: dict):
+        self.message_count += 1
+        
+        if time.time() - self.last_log_time >= 10:
+            self.last_log_time = time.time()
+
         mapped_data = {
             "symbol": msg.get("id", ""),
             "price": float(msg.get("price", 0.0)),
@@ -87,19 +142,58 @@ class StockDataProducer:
         self.producer.poll(0)
 
     async def run(self):
-        try:
-            logger.info(f"Đang kết nối WebSocket cho {len(self.symbols)} symbols...")
-            self.ws = yf.AsyncWebSocket()
-            await self.ws.subscribe(self.symbols)
-            logger.info("Subscribe thành công")
-            
-            async def message_handler(msg):
-                self._send(msg)
-            
-            await self.ws.listen(message_handler)
-        except Exception as e:
-            logger.error(f"Lỗi trong quá trình chạy: {e}")
-            os.kill(os.getpid(), signal.SIGTERM)
+        reconnect_count = 0
+        while reconnect_count < MAX_RECONNECT_ATTEMPTS:
+            try:
+                logger.info(f"Đang kết nối WebSocket cho {len(self.symbols)} symbols... (lần thử {reconnect_count + 1}/{MAX_RECONNECT_ATTEMPTS})")
+                self.ws = yf.AsyncWebSocket()
+                await self.ws.subscribe(self.symbols)
+                logger.info("Subscribe thành công! Bắt đầu nhận data...")
+                reconnect_count = 0
+                self.message_count = 0
+                self.last_message_time = time.time()
+                self.last_log_time = time.time()
+                
+                async def message_handler(msg):
+                    self.last_message_time = time.time()
+                    self._send(msg)
+                
+                async def check_timeout():
+                    while True:
+                        await asyncio.sleep(10)
+                        if is_trading_hours():
+                            if time.time() - self.last_message_time > MESSAGE_TIMEOUT:
+                                logger.error(f"Trong giờ giao dịch nhưng không nhận message trong {MESSAGE_TIMEOUT}s. Force reconnect...")
+                                raise ConnectionClosedError(None, None, "Message timeout")
+                
+                try:
+                    timeout_task = asyncio.create_task(check_timeout())
+                    listen_task = asyncio.create_task(self.ws.listen(message_handler))
+                    done, pending = await asyncio.wait(
+                        [timeout_task, listen_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                    for task in done:
+                        if task.exception():
+                            raise task.exception()
+                except (ConnectionClosedError, Exception) as e:
+                    logger.error(f"Lỗi trong quá trình listen: {e}")
+                    raise
+            except ConnectionClosedError as e:
+                reconnect_count += 1
+                logger.error(f"Lỗi kết nối WebSocket: {e} (lần thử {reconnect_count}/{MAX_RECONNECT_ATTEMPTS})")
+                if reconnect_count >= MAX_RECONNECT_ATTEMPTS:
+                    logger.error(f"Đã vượt quá số lần reconnect. Thoát để Docker restart container...")
+                    sys.exit(1)
+                logger.info(f"Đợi {RECONNECT_DELAY} giây trước khi reconnect...")
+                await asyncio.sleep(RECONNECT_DELAY)
+            except Exception as e:
+                logger.error(f"Lỗi không xác định: {e}. Thoát để Docker restart...")
+                import traceback
+                logger.error(traceback.format_exc())
+                sys.exit(1)
 
         
 async def main():

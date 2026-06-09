@@ -1,13 +1,14 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { BarChart3 } from "lucide-react"
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts"
-import { getApiUrl, getWsUrl } from "@/lib/config"
+import { getApiUrl } from "@/lib/config"
 import type { StockInfo } from "@/types/stock"
 import { Icons } from "@/components/icons"
+import { useStockWSContext } from "@/lib/stockWSContext"
 import { usePredictions } from "@/hooks/usePredictions"
 
 interface IntradayData {
@@ -24,32 +25,18 @@ interface StockChartProps {
   stockInfo?: StockInfo
 }
 
-const isInTradingHours = () => {
-  const now = new Date()
-  const day = now.getDay()
-  const hour = now.getHours()
-  const minute = now.getMinutes()
-  
-  if (day === 0 || day === 6) return false
-  
-  const currentTime = hour * 60 + minute
-  const startTime = 9 * 60
-  const endTime = 15 * 60
-  
-  return currentTime >= startTime && currentTime < endTime
-}
-
 export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProps) {
   const [chartData, setChartData] = useState<IntradayData[]>([])
-  const [isRealtime, setIsRealtime] = useState(false)
-  const wsRef = useRef<WebSocket | null>(null)
+  const [isRealtime, setIsRealtime] = useState(true)
+  const [wsConnected, setWsConnected] = useState(false)
   const predictions = usePredictions()
+  const { subscribe, unsubscribe } = useStockWSContext()
   const trend = predictions[symbol]?.predictionTrend ?? null
 
   const trendBadge = (() => {
     if (!trend) {
       return (
-        <div className="text-sm font-semibold text-gray-400 uppercase tracking-wide">
+        <div className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
           Prediction Trend: —
         </div>
       )
@@ -76,8 +63,8 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
     const config = map[trend]
 
     return (
-      <div className={`flex items-center gap-3 px-4 py-1.5 rounded-full text-sm font-bold uppercase tracking-wide shadow-sm ${config.className}`}>
-        <config.Icon className="h-4 w-4" />
+      <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide shadow-sm ${config.className}`}>
+        <config.Icon className="h-3.5 w-3.5" />
         <span>{config.label}</span>
       </div>
     )
@@ -140,18 +127,6 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
   }
 
 
-  // Check trading hours periodically
-  useEffect(() => {
-    const checkTradingHours = () => {
-      setIsRealtime(isInTradingHours())
-    }
-    
-    checkTradingHours()
-    const interval = setInterval(checkTradingHours, 60000)
-    
-    return () => clearInterval(interval)
-  }, [])
-
   // Load data on mount
   useEffect(() => {
     const loadData = () => {
@@ -180,7 +155,6 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
 
     loadData()
     
-    // Chỉ refresh khi ngoài giờ giao dịch để hiển thị data cuối phiên
     const refreshInterval = setInterval(() => {
       if (!isRealtime) {
         loadData()
@@ -190,95 +164,57 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
     return () => clearInterval(refreshInterval)
   }, [symbol, isRealtime])
 
-  // WebSocket for real-time updates during trading hours
   useEffect(() => {
-    const inTradingHours = isInTradingHours()
-
-    if (inTradingHours) {
-      const socket = new WebSocket(`${getWsUrl()}/stocks/ws/stocks_realtime`)
-      wsRef.current = socket
-
-      socket.onopen = () => {
-        
-      }
-
-      socket.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          if (data.symbol === symbol) {
-            let timeStr = ''
-            if (data.timestamp) {
-              let tsMs: number | null = null
-              
-              if (typeof data.timestamp === 'string') {
-                const match = data.timestamp.match(/\d+/)
-                if (match) {
-                  tsMs = Number(match[0])
-                }
-              } else {
-                tsMs = Number(data.timestamp)
-              }
-              
-              if (tsMs && !isNaN(tsMs)) {
-                const timestamp = new Date(tsMs)
-                timeStr = `${timestamp.getHours().toString().padStart(2, '0')}:${timestamp.getMinutes().toString().padStart(2, '0')}:${timestamp.getSeconds().toString().padStart(2, '0')}`
-              }
-            }
-            
-            if (!timeStr) {
-              const now = new Date()
-              timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
-            }
-            
-            setChartData(prev => {
-              const newData = [...prev]
-              const lastPoint = newData[newData.length - 1]
-              
-              if (lastPoint && lastPoint.time === timeStr) {
-                newData[newData.length - 1] = {
-                  time: timeStr,
-                  price: data.price,
-                  volume: data.day_volume,
-                  change: data.change,
-                  change_percent: data.change_percent
-                }
-              } else {
-                newData.push({
-                  time: timeStr,
-                  price: data.price,
-                  volume: data.day_volume,
-                  change: data.change,
-                  change_percent: data.change_percent
-                })
-              }
-              
-              return newData
-            })
-          }
-        } catch (e) {
-          
+    const id = `stock-chart_${symbol}`
+    setWsConnected(true)
+    subscribe(id, (data) => {
+      if (data.symbol !== symbol) return
+      let timeStr = ''
+      if (data.timestamp) {
+        let tsMs: number | null = null
+        if (typeof data.timestamp === 'string') {
+          const match = data.timestamp.match(/\d+/)
+          if (match) tsMs = Number(match[0])
+        } else {
+          tsMs = Number(data.timestamp)
+        }
+        if (tsMs && !isNaN(tsMs)) {
+          const ts = new Date(tsMs)
+          timeStr = `${ts.getHours().toString().padStart(2, '0')}:${ts.getMinutes().toString().padStart(2, '0')}:${ts.getSeconds().toString().padStart(2, '0')}`
         }
       }
-
-      socket.onerror = (err) => {
-        
+      if (!timeStr) {
+        const now = new Date()
+        timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
       }
-
-      return () => {
-        socket.close()
-      }
+      setChartData(prev => {
+        const newData = [...prev]
+        const lastPoint = newData[newData.length - 1]
+        const point = { time: timeStr, price: data.price, volume: data.day_volume, change: data.change, change_percent: data.change_percent }
+        if (lastPoint && lastPoint.time === timeStr) {
+          newData[newData.length - 1] = point
+        } else {
+          newData.push(point)
+        }
+        return newData
+      })
+    })
+    return () => {
+      setWsConnected(false)
+      unsubscribe(id)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol])
 
   return (
     <Card className="bg-white/95 backdrop-blur-sm border-gray-200 shadow-sm">
       <CardHeader>
         <div className="flex flex-wrap items-center gap-3">
-          <CardTitle className="flex items-center gap-2 text-gray-900 text-2xl font-extrabold">
-            <BarChart3 className="h-5 w-5 text-blue-600 text-2xl font-extrabold" />
+          <CardTitle className="flex items-center gap-2 text-gray-900 text-sm font-bold">
+            <BarChart3 className="h-4 w-4 text-blue-600" />
             Price chart {symbol} - Today
-            {isRealtime && (
-              <span className="text-xs bg-green-600 text-white px-2 py-1 rounded-full">
+            {wsConnected && (
+              <span className="text-[10px] bg-green-600 text-white px-1.5 py-0.5 rounded-full">
                 LIVE
               </span>
             )}
@@ -339,11 +275,11 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
 
         {/* Chart Info */}
         {(chartData.length > 0 || stockInfo) && (
-          <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+          <div className="mt-3 p-3 bg-gray-50 rounded-lg border border-gray-200">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
               <div>
                 <div className="text-gray-500 text-center">Giá mở cửa</div>
-                <div className="font-extrabold text-gray-700 text-center text-2xl">
+                <div className="font-extrabold text-gray-700 text-center text-lg">
                   {chartData.length > 0 
                     ? chartData[0]?.price?.toLocaleString("vi-VN") 
                     : stockInfo?.open?.toLocaleString("vi-VN") || "—"}
@@ -351,7 +287,7 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
               </div>
               <div>
                 <div className="text-gray-500 text-center">Giá cao nhất</div>
-                <div className="font-extrabold text-green-600 text-center text-2xl">
+                <div className="font-extrabold text-green-600 text-center text-lg">
                   {chartData.length > 0 
                     ? Math.max(...chartData.map((d) => d.price)).toLocaleString("vi-VN")
                     : stockInfo?.dayHigh?.toLocaleString("vi-VN") || "—"}
@@ -359,7 +295,7 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
               </div>
               <div>
                 <div className="text-gray-500 text-center">Giá thấp nhất</div>
-                <div className="font-extrabold text-red-600 text-center text-2xl">
+                <div className="font-extrabold text-red-600 text-center text-lg">
                   {chartData.length > 0 
                     ? Math.min(...chartData.map((d) => d.price)).toLocaleString("vi-VN")
                     : stockInfo?.dayLow?.toLocaleString("vi-VN") || "—"}
@@ -367,7 +303,7 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
               </div>
               <div>
                 <div className="text-gray-500 text-center">Giá đóng cửa</div>
-                <div className="font-extrabold text-gray-700 text-center text-2xl">
+                <div className="font-extrabold text-gray-700 text-center text-lg">
                   {isRealtime 
                     ? "—" 
                     : chartData.length > 0
@@ -382,4 +318,3 @@ export function StockChart({ symbol, referencePrice, stockInfo }: StockChartProp
     </Card>
   )
 }
-

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(docker info:*)",
+      "Bash(dpkg -l)",
+      "Bash(curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey)",
+      "Bash(sudo gpg:*)",
+      "Bash(curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list)",
+      "Bash(sudo tee:*)"
+    ]
+  }
+}

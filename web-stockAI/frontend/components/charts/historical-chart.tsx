@@ -157,7 +157,7 @@ export function HistoricalChart({ symbol }: HistoricalChartProps) {
     <Card className="bg-white/95 backdrop-blur-sm border-gray-200 shadow-sm">
       <CardHeader>
         <div className="flex items-center justify-between flex-wrap gap-3">
-          <CardTitle className="flex items-center gap-2 text-gray-900 text-2xl font-extrabold">
+          <CardTitle className="flex items-center gap-2 text-gray-900 text-sm font-bold">
             <TrendingUp className="h-5 w-5 text-blue-600" />
             Historical chart {symbol}
           </CardTitle>
@@ -375,25 +375,25 @@ export function HistoricalChart({ symbol }: HistoricalChartProps) {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
               <div>
                 <div className="text-gray-500 text-center">Period</div>
-                <div className="font-extrabold text-[20px] text-gray-700 text-center">
+                <div className="font-extrabold text-lg text-gray-700 text-center">
                   {timeFrames.find(tf => tf.value === selectedTimeFrame)?.label}
                 </div>
               </div>
               <div>
                 <div className="text-gray-500 text-center">Highest</div>
-                <div className="font-extrabold text-[20px] text-purple-600 text-center">
+                <div className="font-extrabold text-lg text-purple-600 text-center">
                   {Math.max(...chartData.map((d) => d.high)).toLocaleString("vi-VN")}
                 </div>
               </div>
               <div>
                 <div className="text-gray-500 text-center">Lowest</div>
-                <div className="font-extrabold text-[20px] text-amber-600 text-center">
+                <div className="font-extrabold text-lg text-amber-600 text-center">
                   {Math.min(...chartData.map((d) => d.low)).toLocaleString("vi-VN")}
                 </div>
               </div>
               <div>
                 <div className="text-gray-500 text-center">Avg Volume</div>
-                <div className="font-extrabold text-[20px] text-gray-700 text-center">
+                <div className="font-extrabold text-lg text-gray-700 text-center">
                   {(chartData.reduce((sum, d) => sum + d.volume, 0) / chartData.length).toLocaleString("vi-VN", { maximumFractionDigits: 0 })}
                 </div>
               </div>

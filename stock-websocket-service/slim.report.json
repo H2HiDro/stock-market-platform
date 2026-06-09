@@ -1,0 +1,49 @@
+{
+  "document": "doc.report.command",
+  "version": "ov/command/slim/1.1",
+  "engine": "linux/amd64|Aurora|1.41.8-1-g4b0d7e91|4b0d7e915ef33a98a2b32ccc10c8558086b27fe4|2025-12-12_05:28:51AM",
+  "containerized": false,
+  "host_distro": {
+    "name": "Ubuntu",
+    "version": "22.04",
+    "display_name": "Ubuntu 22.04.4 LTS"
+  },
+  "type": "slim",
+  "state": "error",
+  "target_reference": "stock-producer-1",
+  "system": {
+    "type": "",
+    "release": "",
+    "distro": {
+      "name": "",
+      "version": "",
+      "display_name": ""
+    }
+  },
+  "source_image": {
+    "identity": {
+      "id": ""
+    },
+    "size": 0,
+    "size_human": "",
+    "create_time": "",
+    "architecture": "",
+    "container_entry": {
+      "exe_path": ""
+    }
+  },
+  "minified_image_size": 0,
+  "minified_image_size_human": "",
+  "minified_image": "",
+  "minified_image_id": "",
+  "minified_image_digest": "",
+  "minified_image_has_data": false,
+  "minified_by": 0,
+  "artifact_location": "",
+  "container_report_name": "",
+  "seccomp_profile_name": "",
+  "apparmor_profile_name": "",
+  "image_stack": null,
+  "image_created": false,
+  "image_build_engine": ""
+}

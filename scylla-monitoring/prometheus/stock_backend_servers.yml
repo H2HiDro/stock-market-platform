@@ -1,6 +1,0 @@
-- targets:
-  - localhost:8005
-  labels:
-    cluster: stock_backend
-    dc: local
-
