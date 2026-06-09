@@ -1,3 +1,5 @@
+"use client"
+
 import { Header } from "@/components/layout/header"
 import { DashboardOverview } from "@/components/dashboard/dashboard-overview"
 import { Watchlist } from "@/components/user/watchlist"
